@@ -13,6 +13,7 @@
 
 #include "core/collection_entry.h"
 #include "server/common_types.h"
+#include "util/fibers/synchronization.h"
 
 #define QL_COMP_BITS 16
 #define QL_BM_BITS 4
@@ -73,7 +74,8 @@ class QList {
     uint16_t dont_compress : 1;      /* prevent compression of entry that will be used later */
     uint16_t offloaded : 1;          /* node is offloaded to colder storage */
     uint16_t io_pending : 1;         /* node has pending io operation */
-    uint16_t reserved1 : 7;          /* reserved for future use */
+    uint16_t load_pending : 1;       /* node is being loaded from tiered storage */
+    uint16_t reserved1 : 6;          /* reserved for future use */
 
     uint16_t reserved2; /* more bits to steal for future usage */
 
@@ -139,6 +141,7 @@ class QList {
     void (*offload)(QList* ql, Node* node) = nullptr;
     void (*load)(QList* ql, Node* node) = nullptr;
     void (*cleanup)(QList* ql, Node* node) = nullptr;
+    std::unique_ptr<util::fb2::EventCount> node_load_ec = nullptr;
   };
 
   /**
@@ -189,7 +192,10 @@ class QList {
 
   void Push(std::string_view value, Where where);
 
-  // Returns the popped value. Precondition: list is not empty.
+  // Returns the popped value.
+  // Preconditions:
+  //  1. list is not empty.
+  //  2. if tieried, node is materialized
   std::string Pop(Where where);
 
   void AppendListpack(uint8_t* zl);
@@ -276,9 +282,9 @@ class QList {
   }
 
   // Enable tiered storage.
-  void EnableTiering(const TieringParams& params) {
+  void EnableTiering(TieringParams params) {
     tiering_enabled_ = 1;
-    tiering_params_ = std::make_unique<TieringParams>(params);
+    tiering_params_ = std::make_unique<TieringParams>(std::move(params));
   }
 
   // Updates the db index associated with this list.

@@ -189,6 +189,7 @@ QList::Node* CreateRAW(int container, uint8_t* entry, size_t sz) {
   node->dont_compress = 0;
   node->offloaded = 0;
   node->io_pending = 0;
+  node->load_pending = 0;
 
   return node;
 }
@@ -431,7 +432,6 @@ void QList::Node::Upload(QList* ql, std::string_view val) {
   memcpy(entry, val.data(), val.size());
   ql->AdjustMallocSize(val.size());
   ql->AdjustOffloadNodeCount(-1);
-  offloaded = 0;
 }
 
 void QList::SetPackedThreshold(unsigned threshold) {
@@ -601,9 +601,7 @@ string QList::Pop(Where where) {
   /* The head and tail should never be compressed */
   DCHECK_EQ(node->encoding, QUICKLIST_NODE_ENCODING_RAW);
   DCHECK(head_->prev->next == nullptr);
-
-  // Onloading the node if needed
-  Materialize(node);
+  DCHECK(!node->offloaded);
 
   string res;
   if (ABSL_PREDICT_FALSE(QL_NODE_IS_PLAIN(node))) {
@@ -1057,13 +1055,20 @@ void QList::Materialize(Node* node) {
     tiering_params_->cleanup(this, node);
   }
 
+  // Sync point if concurrent fiber requested already node onloading
+  while (node->load_pending) {
+    tiering_params_->node_load_ec->await([node] { return !node->load_pending; });
+  }
+
   // Load the offloaded node data back into memory.
   if (node->offloaded) {
     tiering_params_->load(this, node);
+    tiering_params_->node_load_ec->notifyAll();
   }
 
   DCHECK(!node->offloaded);
   DCHECK(!node->io_pending);
+  DCHECK(!node->load_pending);
   DCHECK(node->entry != nullptr);
 }
 

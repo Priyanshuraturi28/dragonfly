@@ -94,11 +94,14 @@ void OffloadListNode(QList* ql, QList::Node* node) {
 void LoadListNode(QList* ql, QList::Node* node) {
   TieredStorage* ts = EngineShard::tlocal()->tiered_storage();
   DCHECK(ts);
+  node->load_pending = 1;
   QList::stats.onload_requests++;
   auto res = ReadTieredListNode(ql->GetDbIndex(), ql, node, node->GetExternalSlice(), ts).Get();
   if (!res) {
     LOG(WARNING) << "Failed to load list node from tiered storage: " << res.error().message();
   }
+  node->offloaded = 0;
+  node->load_pending = 0;
 }
 
 void CleanupListNode(QList* ql, QList::Node* node) {
@@ -113,6 +116,11 @@ void CleanupListNode(QList* ql, QList::Node* node) {
       ts->Delete(ql->GetDbIndex(), node);
     }
   }
+}
+
+bool IsTieringEnabled() {
+  static const uint32_t threshold = absl::GetFlag(FLAGS_list_tiering_threshold);
+  return threshold > 0 && EngineShard::tlocal()->tiered_storage();
 }
 
 class ListWrapper {
@@ -141,15 +149,15 @@ class ListWrapper {
     // Set db index for new QList
     ql->SetDbIndex(db_id_);
 
-    const uint32_t tiering_node_depth_threshold = absl::GetFlag(FLAGS_list_tiering_threshold);
-    if (tiering_node_depth_threshold > 0 && EngineShard::tlocal()->tiered_storage()) {
+    if (IsTieringEnabled()) {
       QList::TieringParams params{
-          .node_depth_threshold = tiering_node_depth_threshold,
+          .node_depth_threshold = absl::GetFlag(FLAGS_list_tiering_threshold),
           .offload = OffloadListNode,
           .load = LoadListNode,
           .cleanup = CleanupListNode,
+          .node_load_ec = std::make_unique<util::fb2::EventCount>(),
       };
-      ql->EnableTiering(params);
+      ql->EnableTiering(std::move(params));
     }
 
     if (uint32_t zstd_thresh = GetFlag(FLAGS_list_experimental_zstd_dict_threshold);
@@ -224,6 +232,32 @@ class ListWrapper {
 
   size_t Size() const {
     return VisitRef([](auto& list) { return list.Size(); });
+  }
+
+  bool IsQList() const {
+    return std::holds_alternative<QList*>(impl_);
+  }
+
+  bool IsQListNodeTiered(QList::Where where) const {
+    const QList* const* ql = std::get_if<QList*>(&impl_);
+    CHECK(ql);
+    const QList::Node* node = where == QList::HEAD ? (*ql)->Head() : (*ql)->Tail();
+    if (node) {
+      return node->offloaded;
+    }
+    return false;
+  }
+
+  void Materialize(QList::Where where) {
+    if (IsTieringEnabled()) {
+      return visit(Overload{[&](QList* ql) {
+                              QList::Node* node = const_cast<QList::Node*>(
+                                  where == QList::HEAD ? ql->Head() : ql->Tail());
+                              ql->Materialize(node);
+                            },
+                            [&](const LP& lp) { return; }},
+                   impl_);
+    }
   }
 
   string Pop(QList::Where where) {
@@ -385,8 +419,14 @@ class BPopPusher {
   ListDir popdir_, pushdir_;
 };
 
+// When tiered list nodes are loaded, Materialize() yields, allowing multiple
+// concurrent fibers to run on the same key. This tracks how many are active
+// per QList object so the last one to exit is responsible for deleting the empty key.
+thread_local absl::flat_hash_map<void*, uint32_t> tl_tiered_list_blocking_active;
+
 // Called as a callback from BPopGeneric after we've determined which key to pop.
-std::string OpBPop(Transaction* t, EngineShard* shard, std::string_view key, ListDir dir) {
+std::optional<std::string> OpBPop(Transaction* t, EngineShard* shard, std::string_view key,
+                                  ListDir dir) {
   DVLOG(2) << "popping from " << key << " " << t->DebugId();
 
   auto& db_slice = t->GetDbSlice(shard->shard_id());
@@ -395,19 +435,61 @@ std::string OpBPop(Transaction* t, EngineShard* shard, std::string_view key, Lis
   CHECK(it_res) << t->DebugId() << " " << key;  // must exist and must be ok.
 
   auto it = it_res->it;
-  std::string value;
-  size_t len;
+
+  OpArgs op_args = t->GetOpArgs(shard);
 
   ListWrapper lw = GetLW(t->GetDbContext().db_index, it->second);
   QList::Where where = ToWhere(dir);
-  value = lw.Pop(where);
+
+  // QList node is tiered. We increment the active-fiber counter to track concurrent
+  // fibers operating on the same list.
+  const bool tiered_qlist = IsTieringEnabled() && lw.IsQList();
+  if (tiered_qlist) {
+    tl_tiered_list_blocking_active[it->second.RObjPtr()]++;
+  }
+
+  // Materialize loop: loads the current head/tail node into memory before popping.
+  // Since Materialize may yield, a concurrent fiber can drain the current node
+  // and move the list to a different offloaded head/tail node while this fiber
+  // is suspended. Re-check in a loop until the current node remains valid.
+  // This path is only used for tiered QList nodes.
+  while (tiered_qlist && lw.IsQListNodeTiered(where)) {
+    lw.Materialize(where);
+    // The complete list may be drained while we're yielded because multiple fibers can
+    // resume concurrently and consume its elements. Only the last active fiber
+    // deletes the empty key and performs cleanup; all others return nullopt
+    // since no element is available anymore.
+    if (lw.Size() == 0) {
+      const bool last = (--tl_tiered_list_blocking_active[it->second.RObjPtr()] == 0);
+      if (last) {
+        tl_tiered_list_blocking_active.erase(it->second.RObjPtr());
+        it_res->post_updater.Run();
+        op_args.GetDbSlice().Del(op_args.db_cntx, it);
+      }
+      return std::nullopt;
+    }
+  }
+
+  // The current node is guaranteed to be in memory. We safely pop one element.
+  string value = lw.Pop(where);
   lw.Launder(&it->second);
-  len = lw.Size();
+  size_t len = lw.Size();
+
+  // Last fiber to exit owns deletion if the list is now empty. Because multiple
+  // fibers may concurrently process the same list, we track active fibers via a
+  // reference counter. Only the final fiber to leave cleans up shared bookkeeping.
+  bool last_active = true;
+  if (tiered_qlist) {
+    last_active = (--tl_tiered_list_blocking_active[it->second.RObjPtr()] == 0);
+    if (last_active) {
+      tl_tiered_list_blocking_active.erase(it->second.RObjPtr());
+    }
+  }
 
   it_res->post_updater.Run();
 
-  OpArgs op_args = t->GetOpArgs(shard);
-  if (len == 0) {
+  // Delete the empty key only if non-tiered or last active fiber.
+  if (len == 0 && (!tiered_qlist || last_active)) {
     DVLOG(1) << "deleting key " << key << " " << t->DebugId();
     op_args.GetDbSlice().Del(op_args.db_cntx, it);
   }
@@ -445,13 +527,57 @@ OpResult<string> OpMoveSingleShard(const OpArgs& op_args, string_view src, strin
   auto src_it = src_res->it;
   string val;
   ListWrapper srcql_v2 = GetLW(op_args.db_cntx.db_index, src_it->second);
-  size_t prev_len = srcql_v2.Size();
 
   if (src == dest) {  // simple case.
+    // In tiered mode, only a first fiber is allowed to perform the operation on
+    // a given QList node at a time. If another fiber is already active, this one
+    // returns KEY_NOTFOUND to avoid concurrent processing of the same node.
+    const bool tiered_src_dest =
+        IsTieringEnabled() && srcql_v2.IsQList() && srcql_v2.IsQListNodeTiered(ToWhere(src_dir));
+
+    if (tiered_src_dest) {
+      if (tl_tiered_list_blocking_active[src_it->second.RObjPtr()] == 0) {
+        tl_tiered_list_blocking_active[src_it->second.RObjPtr()]++;
+      } else {
+        return OpStatus::KEY_NOTFOUND;
+      }
+    }
+
+    srcql_v2.Materialize(ToWhere(src_dir));
     val = srcql_v2.Pop(ToWhere(src_dir));
     srcql_v2.Push(val, ToWhere(dest_dir));
     srcql_v2.Launder(&src_it->second);
+
+    if (tiered_src_dest) {
+      tl_tiered_list_blocking_active.erase(src_it->second.RObjPtr());
+    }
+
     return val;
+  }
+
+  // If tiered, this path should follow the same tiered-mode handling logic as OpBPop
+  // to prevent incorrect behavior under concurrent execution.
+  const bool tiered_src_dest = IsTieringEnabled() && srcql_v2.IsQList();
+
+  if (tiered_src_dest) {
+    tl_tiered_list_blocking_active[src_it->second.RObjPtr()]++;
+  }
+
+  // Materialize loop: mirrors OpBPop. After a yield, a concurrent fiber may have popped
+  // the original node, leaving the new head/tail as a different offloaded node.
+  // tiered_src_dest is always true inside the loop body (we only enter when node is tiered).
+  while (srcql_v2.IsQList() && srcql_v2.IsQListNodeTiered(ToWhere(src_dir))) {
+    srcql_v2.Materialize(ToWhere(src_dir));
+
+    if (srcql_v2.Size() == 0) {
+      const bool last = (--tl_tiered_list_blocking_active[src_it->second.RObjPtr()] == 0);
+      if (last) {
+        tl_tiered_list_blocking_active.erase(src_it->second.RObjPtr());
+        src_res->post_updater.Run();
+        db_slice.Del(op_args.db_cntx, src_it);
+      }
+      return OpStatus::KEY_NOTFOUND;
+    }
   }
 
   src_res->post_updater.Run();
@@ -466,16 +592,25 @@ OpResult<string> OpMoveSingleShard(const OpArgs& op_args, string_view src, strin
 
   ListWrapper dest_lw = CreateOrGet(op_args, dest, dest_res.is_new, &dest_res.it->second);
 
+  // Current node is guaranteed in memory after the loop above.
   val = srcql_v2.Pop(ToWhere(src_dir));
   srcql_v2.Launder(&src_it->second);
 
   dest_lw.Push(val, ToWhere(dest_dir));
   dest_lw.Launder(&dest_res.it->second);
 
+  bool last_active = true;
+  if (tiered_src_dest) {
+    last_active = (--tl_tiered_list_blocking_active[src_it->second.RObjPtr()] == 0);
+    if (last_active) {
+      tl_tiered_list_blocking_active.erase(src_it->second.RObjPtr());
+    }
+  }
+
   src_res->post_updater.Run();
   dest_res.post_updater.Run();
 
-  if (prev_len == 1) {
+  if (srcql_v2.Size() == 0 && (!tiered_src_dest || last_active)) {
     db_slice.Del(op_args.db_cntx, src_it);
   }
 
@@ -565,6 +700,7 @@ OpResult<StringVec> OpPop(const OpArgs& op_args, string_view key, ListDir dir, u
 
   QList::Where where = ToWhere(dir);
   for (unsigned i = 0; i < count; ++i) {
+    lw.Materialize(where);
     string val = lw.Pop(where);
     if (return_results) {
       res.push_back(std::move(val));
@@ -1001,6 +1137,13 @@ OpResult<string> BPopPusher::RunSingle(time_point tp, Transaction* tx, Connectio
     return status;
 
   tx->Execute(cb_move, true);
+
+  // In tiered mode, concurrent fibers may be excluded from processing the node,
+  // resulting in KEY_NOTFOUND. Treat this as a transient outcome and map it to
+  // TIMED_OUT to return an empty response to the client.
+  if (op_res.status() == OpStatus::KEY_NOTFOUND)
+    op_res = OpStatus::TIMED_OUT;
+
   return op_res;
 }
 
@@ -1090,7 +1233,7 @@ void BPopGeneric(ListDir dir, CmdArgList args, CommandContext* cmd_cntx) {
   }
   VLOG(1) << "BPop timeout(" << timeout << ")";
 
-  std::string popped_value;
+  std::optional<std::string> popped_value;
   auto cb = [dir, &popped_value](Transaction* t, EngineShard* shard, std::string_view key) {
     popped_value = OpBPop(t, shard, key, dir);
   };
@@ -1103,7 +1246,12 @@ void BPopGeneric(ListDir dir, CmdArgList args, CommandContext* cmd_cntx) {
   auto* rb = static_cast<RedisReplyBuilder*>(cmd_cntx->rb());
   if (popped_key) {
     DVLOG(1) << "BPop " << tx->DebugId() << " popped from key " << popped_key;  // key.
-    std::string_view str_arr[2] = {*popped_key, popped_value};
+    // In tiered mode, multiple concurrent consumers may race to drain the same list.
+    // Return empty if the list has already been fully consumed.
+    if (!popped_value) {
+      return rb->SendNullArray();
+    }
+    std::string_view str_arr[2] = {*popped_key, *popped_value};
     return rb->SendBulkStrArr(str_arr);
   }
 
