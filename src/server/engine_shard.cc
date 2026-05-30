@@ -231,7 +231,7 @@ string EngineShard::TxQueueInfo::Format() const {
 }
 
 EngineShard::Stats& EngineShard::Stats::operator+=(const Stats& o) {
-  static_assert(sizeof(Stats) == 152);
+  static_assert(sizeof(Stats) == 160);
 
 #define ADD(x) x += o.x
 
@@ -254,6 +254,7 @@ EngineShard::Stats& EngineShard::Stats::operator+=(const Stats& o) {
   ADD(stream_sequential_accesses);
   ADD(stream_random_accesses);
   ADD(stream_fetch_all_accesses);
+  ADD(borrowed_string_views_total);
 
 #undef ADD
   return *this;
@@ -750,6 +751,9 @@ void EngineShard::RemoveContTx(Transaction* tx) {
 void EngineShard::Heartbeat() {
   DVLOG(3) << " Hearbeat";
   DCHECK(namespaces);
+
+  // Reap zero-copy GET pins whose refcnt has dropped to 0. Cheap and idempotent.
+  CompactObj::DrainPendingReads();
 
   CacheStats();
 

@@ -34,12 +34,18 @@
 #include "server/generic_family.h"
 #include "server/journal/journal.h"
 #include "server/search/doc_index.h"
+#include "server/server_state.h"
 #include "server/table.h"
 #include "server/tiered_storage.h"
 #include "server/transaction.h"
 #include "util/fibers/future.h"
 
 ABSL_FLAG(bool, mget_dedup_keys, false, "If true, MGET will deduplicate keys");
+
+ABSL_FLAG(bool, get_zero_copy, true,
+          "If true, GET returns a borrowed view into the CompactObj raw payload "
+          "(zero-copy) for large raw strings; if false, falls back to the "
+          "materializing path. Toggle to A/B benchmark the zero-copy GET path.");
 
 namespace dfly {
 
@@ -57,11 +63,49 @@ constexpr uint32_t kMaxStrLen = 1 << 28;
 
 // Either immediately available value or tiering future + result
 template <typename T> using TResultOrT = variant<T, TieredStorage::TResult<T>>;
-using StringResult = TResultOrT<string>;
+
+// StringResult adds a borrowed-view alternative on top of the generic
+// 2-variant shape. Used by read-only commands (GET) that can borrow the
+// value directly from the shard's CompactObj instead of materializing an
+// owned std::string. Mutating commands (GETDEL/GETEX/GETSET) must NEVER
+// produce the cmn::BorrowedString alternative because they free/replace
+// the underlying storage.
+//
+// cmn::BorrowedString carries its own pin + release fn; ownership flows
+// from CompactObj::TryBorrow through the variant into SendBulkStringBorrowed,
+// which parks the borrow until writev (direct sink) or replay (capture).
+using StringResult =
+    std::variant<std::string, cmn::BorrowedString, TieredStorage::TResult<std::string>>;
 
 StringResult ReadString(DbIndex dbid, string_view key, const PrimeValue& pv, EngineShard* es) {
   return pv.IsExternal() ? StringResult{ReadTieredString(dbid, key, pv, es->tiered_storage())}
                          : StringResult{pv.ToString()};
+}
+
+// Read-only fast path for GET: returns a borrowed view directly into the
+// shard's CompactObj storage when the value is a raw (NONE_ENC) or ASCII-
+// packed (ASCII1_ENC / ASCII2_ENC) large string; otherwise falls back to
+// the materializing ReadString.
+//
+// For NONE_ENC: caller streams the bytes directly.
+// For ASCII1/2_ENC: caller's reply path decodes chunk-by-chunk into its own
+// scratch (no full decoded buffer is ever held). Either way the borrowed
+// bytes remain valid only as long as the underlying storage is not mutated,
+// freed, or relocated — see CompactObj::TryBorrow and the
+// facade::SinkReplyBuilder::ReplyScope contract.
+StringResult ReadStringBorrow(DbIndex dbid, string_view key, const PrimeValue& pv,
+                              EngineShard* es) {
+  static thread_local bool zero_copy_enabled = absl::GetFlag(FLAGS_get_zero_copy);
+  if (zero_copy_enabled && !pv.IsExternal()) {
+    if (auto raw = pv.TryBorrow()) {
+      // TryBorrow already registered the pin and stamped read_pending. We
+      // move the whole borrow through; SendBulkStringBorrowed parks the pin
+      // until the reply's writev completes (or replay, for captures).
+      ++es->stats().borrowed_string_views_total;
+      return StringResult{std::move(*raw)};
+    }
+  }
+  return ReadString(dbid, key, pv, es);
 }
 
 // Helper for performing SET operations with various options
@@ -678,11 +722,43 @@ struct GetReplies {
       Send(iores.error().message());
   }
 
+  // Specialized overload for StringResult (3-variant: string / string_view /
+  // tiering future). The string_view alternative carries a borrowed view into
+  // the shard's storage and must be sent before any mutation can race —
+  // ReplyScope provides the lifetime contract during reply construction.
+  void Send(StringResult&& res) const {
+    if (holds_alternative<std::string>(res))
+      return Send(get<std::string>(res));
+    if (holds_alternative<cmn::BorrowedString>(res)) {
+      // Move the BorrowedString into SendBulkStringBorrowed; the reply
+      // builder dispatches on encoding (NONE_ENC iovec ref, ASCII chunked
+      // decode) and parks the pin until writev completes — or, for a
+      // CapturingReplyBuilder, moves it into the captured payload so the
+      // pin lives through capture/replay.
+      ++ServerState::tlocal()->stats.borrowed_strings_sent_total;
+      rb->SendBulkStringBorrowed(std::move(get<cmn::BorrowedString>(res)));
+      return;
+    }
+    auto fut = get<TieredStorage::TResult<std::string>>(std::move(res));
+    io::Result<std::string> iores = fut.Get();
+    if (iores.has_value())
+      Send(*iores);
+    else
+      Send(iores.error().message());
+  }
+
   void Send(size_t val) const {
     rb->SendLong(val);
   }
 
   void Send(string_view str) const {
+    rb->SendBulkString(str);
+  }
+
+  // Explicit overload to disambiguate against Send(StringResult&&): std::string
+  // could otherwise resolve either way (string -> variant alternative or
+  // string -> string_view), making Send(std::string) ambiguous.
+  void Send(const std::string& str) const {
     rb->SendBulkString(str);
   }
 
@@ -1199,7 +1275,12 @@ cmd::CmdR CmdGet(CmdArgList args, CommandContext* cmd_cntx) {
     if (!it_res.ok())
       return it_res.status();
 
-    return ReadString(tx->GetDbIndex(), key, (*it_res)->second, es);
+    // GET is read-only: prefer a borrowed view into the shard storage for
+    // raw (NONE_ENC) large strings, skipping the per-call std::string
+    // allocation. Falls back to ReadString for inline / int / small /
+    // encoded / external values. The borrowed view is consumed within the
+    // reply scope before any mutation can race.
+    return ReadStringBorrow(tx->GetDbIndex(), key, (*it_res)->second, es);
   };
 
   GetReplies{cmd_cntx->rb()}.Send(co_await cmd::SingleHopT(cb));
