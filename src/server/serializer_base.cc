@@ -207,17 +207,13 @@ void SerializerBase::OnChange(DbIndex db_index, const ChangeReq& req) {
 }
 
 void SerializerBase::OnChangeBlocking(DbIndex db_index, PrimeTable::bucket_iterator it) {
-  std::string_view active_name = util::fb2::detail::FiberActive()->name();
-  if (!absl::StartsWith(active_name, "shard_queue") &&  //
-      !absl::StartsWith(active_name, "l2_queue") &&     // pipelining
-      !absl::StartsWith(active_name, "SliceSnapshot") &&
-      active_name != "Dispatched" &&   // Comes from OnAllShards(... { migration->RunSync(); });
-      active_name != "Debug/Traverse"  // DEBUG OBJHIST/UNIQ-STRS cleanup of lazy-expired empty
-                                       // containers; runs on the shard proactor so ordering holds.
-  ) {
-    LOG(DFATAL) << "Unexpected fiber: " << active_name << " on " << util::fb2::GetStacktrace();
-  }
-
+  // OnChangeBlocking can be reached almost from any fiber.
+  // Specifically, they can be called from the following fibers:
+  // 1. shard_queue, SliceSnapshot - trivial.
+  // 2. DflyConn/AsyncFiber - connection fiber that runs an inline transaction.
+  // 3. l2_queue via pipelining.
+  // 4."Debug/Traverse" - DEBUG OBJHIST/UNIQ-STRS delete lazy-expired empty collections.
+  // 5. "Dispatched" -  OnAllShards(... { migration->RunSync(); });
   ProcessBucket(db_index, it, true);
 }
 
