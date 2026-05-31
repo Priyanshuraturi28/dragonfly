@@ -1899,6 +1899,24 @@ void PrintPrometheusMetrics(uint64_t uptime, const Metrics& m, DflyCmd* dfly_cmd
                               MetricType::COUNTER, &resp->body());
   }
 
+  // Batch density: replies bundled per Send() syscall.
+  {
+    const auto& hist = m.facade_stats.reply_stats.replies_per_send_hist;
+    AppendMetricHeader("replies_per_flush", "Replies bundled per socket write", MetricType::SUMMARY,
+                       &resp->body());
+    if (hist.count() > 0) {
+      auto [p50, p95, p99] = hist.Percentiles(50, 95, 99);
+      AppendMetricValue("replies_per_flush", p50, {"quantile"}, {"0.5"}, &resp->body());
+      AppendMetricValue("replies_per_flush", p95, {"quantile"}, {"0.95"}, &resp->body());
+      AppendMetricValue("replies_per_flush", p99, {"quantile"}, {"0.99"}, &resp->body());
+    }
+    const string full_name = GetMetricFullName("replies_per_flush");
+    absl::StrAppend(&resp->body(), full_name, "_sum ", hist.sum(), "\n");
+    absl::StrAppend(&resp->body(), full_name, "_count ", hist.count(), "\n");
+    absl::StrAppend(&resp->body(), full_name, "_avg ",
+                    hist.count() > 0 ? hist.sum() / hist.count() : 0, "\n");
+  }
+
   AppendMetricWithoutLabels("script_error_total", "", m.facade_stats.reply_stats.script_error_count,
                             MetricType::COUNTER, &resp->body());
 

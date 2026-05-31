@@ -64,7 +64,7 @@ ReplyStats::ReplyStats(ReplyStats&& other) noexcept {
 }
 
 ReplyStats& ReplyStats::operator+=(const ReplyStats& o) {
-  static_assert(sizeof(ReplyStats) == 80u + kSanitizerOverhead);
+  static_assert(sizeof(ReplyStats) == 136u + kSanitizerOverhead);
   ADD(io_write_cnt);
   ADD(io_write_bytes);
 
@@ -75,6 +75,7 @@ ReplyStats& ReplyStats::operator+=(const ReplyStats& o) {
   ADD(script_error_count);
 
   send_stats += o.send_stats;
+  replies_per_send_hist.Merge(o.replies_per_send_hist);
   squashing_current_reply_size.fetch_add(o.squashing_current_reply_size.load(memory_order_relaxed),
                                          memory_order_relaxed);
   return *this;
@@ -83,13 +84,14 @@ ReplyStats& ReplyStats::operator+=(const ReplyStats& o) {
 #undef ADD
 
 ReplyStats& ReplyStats::operator=(const ReplyStats& o) {
-  static_assert(sizeof(ReplyStats) == 80u + kSanitizerOverhead);
+  static_assert(sizeof(ReplyStats) == 136u + kSanitizerOverhead);
 
   if (this == &o) {
     return *this;
   }
 
   send_stats = o.send_stats;
+  replies_per_send_hist = o.replies_per_send_hist;
   io_write_cnt = o.io_write_cnt;
   io_write_bytes = o.io_write_bytes;
   err_count = o.err_count;

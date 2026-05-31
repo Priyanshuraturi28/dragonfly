@@ -151,8 +151,9 @@ class SinkReplyBuilder {
   // external data (WriteRef). Validity is ensured by FinishScope that either flushes before ref
   // lifetime ends or copies refs to the buffer.
   absl::InlinedVector<iovec, 16> vecs_;
-  size_t guaranteed_pieces_ = 0;   // length of prefix of vecs_ that are guaranteed to be pieces
-  uint64_t send_time_cycles_ = 0;  // base::CycleClock::Now() at Send() entry, 0 when idle
+  size_t guaranteed_pieces_ = 0;     // length of prefix of vecs_ that are guaranteed to be pieces
+  uint64_t send_time_cycles_ = 0;    // base::CycleClock::Now() at Send() entry, 0 when idle
+  size_t replies_at_last_send_ = 0;  // replies_recorded_ snapshot at last Send()
 };
 
 class MCReplyBuilder : public SinkReplyBuilder {

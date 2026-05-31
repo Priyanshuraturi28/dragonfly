@@ -84,6 +84,10 @@ struct ReplyStats {
   // Send() operations that are written to sockets
   SendStats send_stats;
 
+  // Distribution of replies bundled per Send() syscall (batch density).
+  // V1 with good batching will show peaks at 50-100+; V2 over-flushing shows peaks at 1-2.
+  base::Histogram replies_per_send_hist;
+
   size_t io_write_cnt = 0;
   size_t io_write_bytes = 0;
   absl::flat_hash_map<std::string, uint64_t> err_count;

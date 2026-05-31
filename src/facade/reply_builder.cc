@@ -218,6 +218,14 @@ void SinkReplyBuilder::Send() {
   uint64_t after_cycles = base::CycleClock::Now();
   reply_stats.send_stats.count++;
   reply_stats.send_stats.total_duration += (after_cycles - pin.timestamp_cycles);
+
+  // Record batch density: how many replies were coalesced into this single Send() syscall.
+  size_t batch_size = replies_recorded_ - replies_at_last_send_;
+  if (batch_size > 0) {
+    reply_stats.replies_per_send_hist.Add(batch_size);
+  }
+  replies_at_last_send_ = replies_recorded_;
+
   DVLOG(2) << "Finished writing " << total_size_ << " bytes";
 }
 
