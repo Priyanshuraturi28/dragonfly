@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -21,6 +22,13 @@ namespace dfly {
 // SimdOp<T, N> wraps N consecutive uint64_t lanes behind the GCC/Clang
 // vector-extension type. Compare ops produce another SimdOp whose lanes are
 // all-ones or all-zeros, which GetMSBs() then compresses to a scalar.
+//
+// All operations are constexpr and noexcept. The constexpr paths sidestep memcpy
+// and the movemask intrinsics (neither is a constant expression) via
+// std::is_constant_evaluated(); the runtime paths are unchanged. Note: only GCC
+// can actually constant-evaluate Load()/GetMSBs() — clang (through clang-18) does
+// not allow reading or bit_cast'ing a vector-extension lane in a constant
+// expression. The markings stay portable and harmless on clang regardless.
 template <class T, std::size_t N> class SimdOp {
   static_assert(std::is_integral_v<T>, "lane type must be integral");
   static_assert(sizeof(T) == 8, "only 64-bit lanes are supported today");
@@ -32,48 +40,66 @@ template <class T, std::size_t N> class SimdOp {
   using BitsType = std::uint32_t;
   static constexpr std::size_t kLanes = N;
 
-  SimdOp() = default;
+  constexpr SimdOp() noexcept = default;
 
   // Filling via `Vec{} + value` lowers to vpbroadcast on AVX2 / dup on
   // NEON; a per-lane scalar loop pessimizes to vpinsrq + vperm2i128.
-  static SimdOp Fill(T value) {
+  static constexpr SimdOp Fill(T value) noexcept {
     return Vec{} + value;
   }
 
-  static SimdOp Load(const T* ptr) {
+  static constexpr SimdOp Load(const T* ptr) noexcept {
+    // During constant evaluation memcpy is unavailable, so bit_cast a
+    // lane-wise copy. At runtime the memcpy lowers to a single (unaligned)
+    // vector load — the codegen the hot probe path relies on.
+    if (std::is_constant_evaluated()) {
+      std::array<T, N> lanes{};
+      for (std::size_t i = 0; i < N; ++i)
+        lanes[i] = ptr[i];
+      return std::bit_cast<Vec>(lanes);
+    }
     Vec v;
     std::memcpy(&v, ptr, sizeof(Vec));
     return v;
   }
 
-  SimdOp operator&(const SimdOp& o) const {
+  constexpr SimdOp operator&(const SimdOp& o) const noexcept {
     return v_ & o.v_;
   }
 
-  SimdOp operator|(const SimdOp& o) const {
+  constexpr SimdOp operator|(const SimdOp& o) const noexcept {
     return v_ | o.v_;
   }
 
-  SimdOp operator>>(unsigned shift) const {
+  constexpr SimdOp operator>>(unsigned shift) const noexcept {
     return v_ >> shift;
   }
 
-  SimdOp operator~() const {
+  constexpr SimdOp operator~() const noexcept {
     return ~v_;
   }
 
-  SimdOp operator==(const SimdOp& o) const {  // NOLINT
+  constexpr SimdOp operator==(const SimdOp& o) const noexcept {  // NOLINT
     return Vec(v_ == o.v_);
   }
 
-  SimdOp operator==(T value) const {  // NOLINT
+  constexpr SimdOp operator==(T value) const noexcept {  // NOLINT
     return Vec(v_ == (Vec{} + value));
   }
 
   // Packs the most-significant bit of every lane into a uint32_t bitmask
   // (LSB = lane 0). For the output of `operator==` (lanes are all-ones or
   // all-zeros) this is equivalent to "bit i set iff lane i is non-zero".
-  BitsType GetMSBs() const {
+  constexpr BitsType GetMSBs() const noexcept {
+    // The movemask intrinsics aren't usable during constant evaluation; fall
+    // back to the portable scalar collapse there. At runtime this branch folds
+    // away and the hand-written per-ISA path below is used.
+    if (std::is_constant_evaluated()) {
+      BitsType m = 0;
+      for (std::size_t i = 0; i < N; ++i)
+        m |= static_cast<BitsType>(v_[i] != 0) << i;
+      return m;
+    }
     // We hand-write the per-ISA movemask because no portable C++ /
     // vector-extension formulation lowers to a single movemask instruction
     // — every alternative we tried measured ~5% slower on OAHSet's hot path.
@@ -110,7 +136,7 @@ template <class T, std::size_t N> class SimdOp {
   }
 
  private:
-  SimdOp(Vec v) : v_(v) {  // NOLINT(google-explicit-constructor)
+  constexpr SimdOp(Vec v) noexcept : v_(v) {  // NOLINT(google-explicit-constructor)
   }
 
   Vec v_{};

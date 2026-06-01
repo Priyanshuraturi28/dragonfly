@@ -14,6 +14,23 @@ namespace dfly {
 using U64x2 = SimdOp<std::uint64_t, 2>;
 using U64x4 = SimdOp<std::uint64_t, 4>;
 
+// Compile-time check that SimdOp is usable in a constant expression. Guarded to
+// GCC: clang (through at least clang-18) does not support reading a lane of a
+// vector-extension type or bit_cast'ing one in a constant expression, so Load()
+// and GetMSBs() can only be constant-evaluated under GCC. The constexpr markings
+// themselves are portable and harmless on clang (see simd_op.h).
+#if defined(__GNUC__) && !defined(__clang__)
+namespace {
+constexpr std::uint64_t kArr[4] = {0, 5, 0, 9};
+static_assert(U64x4::Load(kArr).GetMSBs() == 0b1010u);
+static_assert((U64x4::Fill(7) == U64x4::Load(kArr)).GetMSBs() == 0u);
+static_assert(((U64x4::Fill(0xF0) & U64x4::Fill(0x0F)) == std::uint64_t(0)).GetMSBs() == 0xFu);
+static_assert((U64x4::Fill(0x100) >> 8).GetMSBs() == 0xFu);
+constexpr std::uint64_t kPair[2] = {0, 3};
+static_assert(U64x2::Load(kPair).GetMSBs() == 0b10u);
+}  // namespace
+#endif
+
 TEST(SimdOpTest, FillAndLoadAreEquivalent) {
   std::uint64_t arr[4] = {7, 7, 7, 7};
   auto a = U64x4::Fill(7);
